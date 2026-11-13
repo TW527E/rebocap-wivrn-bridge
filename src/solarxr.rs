@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -159,8 +159,49 @@ fn transform(mut pose: Pose, offset: [f32; 3], yaw: f64) -> Pose {
     pose
 }
 
+/// Wakes the worker as soon as a tracker update arrives instead of waiting for its next poll.
+#[derive(Default)]
+struct Wake {
+    pending: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Wake {
+    fn notify(&self) {
+        *self.pending.lock().unwrap() = true;
+        self.cv.notify_one();
+    }
+
+    /// Returns early when notified; otherwise after `timeout`, so new clients are still accepted.
+    fn wait(&self, timeout: Duration) {
+        let pending = self.pending.lock().unwrap();
+        let (mut pending, _) = self
+            .cv
+            .wait_timeout_while(pending, timeout, |p| !*p)
+            .unwrap();
+        *pending = false;
+    }
+}
+
+/// Feeds Rebocap messages into the server from another thread (the bridge reader).
+#[derive(Clone)]
+pub struct Handle {
+    state: Arc<Mutex<State>>,
+    wake: Arc<Wake>,
+}
+
+impl Handle {
+    pub fn receive(&self, body: &Body) {
+        self.state.lock().unwrap().receive(body);
+        if matches!(body, Body::Position(_) | Body::TrackerStatus(_)) {
+            self.wake.notify();
+        }
+    }
+}
+
 pub struct Server {
     state: Arc<Mutex<State>>,
+    wake: Arc<Wake>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     paths: Vec<(PathBuf, u64)>,
@@ -184,6 +225,7 @@ impl Server {
         let stop = Arc::new(AtomicBool::new(false));
         let mut server = Self {
             state,
+            wake: Arc::default(),
             stop,
             worker: None,
             paths: vec![],
@@ -203,8 +245,9 @@ impl Server {
             listeners.push(listener);
         }
         let state = server.state.clone();
+        let wake = server.wake.clone();
         let stop = server.stop.clone();
-        server.worker = Some(thread::spawn(move || serve(listeners, state, stop)));
+        server.worker = Some(thread::spawn(move || serve(listeners, state, wake, stop)));
         eprintln!(
             "SolarXR ready at {}; connect the headset after this message",
             server.paths[0].0.display()
@@ -212,8 +255,11 @@ impl Server {
         Ok(server)
     }
 
-    pub fn receive(&self, body: &Body) {
-        self.state.lock().unwrap().receive(body);
+    pub fn handle(&self) -> Handle {
+        Handle {
+            state: self.state.clone(),
+            wake: self.wake.clone(),
+        }
     }
     pub fn clear(&self) {
         self.state.lock().unwrap().clear();
@@ -305,7 +351,12 @@ impl Client {
     }
 }
 
-fn serve(listeners: Vec<UnixListener>, state: Arc<Mutex<State>>, stop: Arc<AtomicBool>) {
+fn serve(
+    listeners: Vec<UnixListener>,
+    state: Arc<Mutex<State>>,
+    wake: Arc<Wake>,
+    stop: Arc<AtomicBool>,
+) {
     // ponytail: one worker and up to eight clients; enough for one WiVRn runtime.
     let mut clients: Vec<Client> = vec![];
     while !stop.load(Ordering::Relaxed) && !crate::INTERRUPTED.load(Ordering::Relaxed) {
@@ -339,7 +390,7 @@ fn serve(listeners: Vec<UnixListener>, state: Arc<Mutex<State>>, stop: Arc<Atomi
             }
         });
         drop(state);
-        thread::sleep(Duration::from_millis(10));
+        wake.wait(Duration::from_millis(10));
     }
     let mut state = state.lock().unwrap();
     state.clear();
@@ -749,7 +800,7 @@ mod tests {
         let worker = {
             let shared = shared.clone();
             let stop = stop.clone();
-            thread::spawn(move || serve(vec![listener], shared, stop))
+            thread::spawn(move || serve(vec![listener], shared, Arc::default(), stop))
         };
         let mut runtime = UnixStream::connect(&path).unwrap();
         runtime

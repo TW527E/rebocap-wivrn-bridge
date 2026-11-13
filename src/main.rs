@@ -92,7 +92,6 @@ struct Tracker {
 fn receive_trackers(
     rx: &Receiver<Option<Body>>,
     trackers: &mut HashMap<i32, Tracker>,
-    solarxr: Option<&solarxr::Server>,
 ) -> (bool, bool) {
     let mut received = false;
     loop {
@@ -104,9 +103,6 @@ fn receive_trackers(
             Err(mpsc::TryRecvError::Empty) => return (true, received),
             Err(mpsc::TryRecvError::Disconnected) => return (false, received),
         };
-        if let (Some(server), Some(body)) = (solarxr, &msg) {
-            server.receive(body);
-        }
         match msg {
             Some(Body::TrackerAdded(d)) => {
                 let t = trackers.entry(d.tracker_id).or_default();
@@ -148,13 +144,21 @@ fn receive_trackers(
     }
 }
 
-fn connect(addr: SocketAddr) -> io::Result<(TcpStream, Receiver<Option<Body>>)> {
+fn connect(
+    addr: SocketAddr,
+    solarxr: Option<solarxr::Handle>,
+) -> io::Result<(TcpStream, Receiver<Option<Body>>)> {
     let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     socket.set_nodelay(true)?;
     let mut reader = socket.try_clone()?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         while let Ok(message) = protocol::receive(&mut reader) {
+            // Publish to SolarXR right here: waiting for the main loop's next 10 ms tick
+            // would add up to a tick of latency to every tracker pose.
+            if let (Some(server), Some(body)) = (&solarxr, &message.body) {
+                server.receive(body);
+            }
             if tx.send(message.body).is_err() {
                 break;
             }
@@ -285,7 +289,12 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
 
         if connected.is_none() && last_connect.elapsed() >= Duration::from_secs(1) {
             last_connect = Instant::now();
-            match connect(addr) {
+            // Clear before the reader thread starts: it publishes to SolarXR directly, so a
+            // clear after connect could drop a TrackerAdded that already arrived.
+            if let Some(server) = solarxr {
+                server.clear();
+            }
+            match connect(addr, solarxr.map(solarxr::Server::handle)) {
                 Ok((socket, rx)) => {
                     connected = Some((socket, rx));
                     connect_error_reported = false;
@@ -295,9 +304,6 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
                     bridge_wait_started = Instant::now();
                     bridge_wait_reported = false;
                     trackers.clear();
-                    if let Some(server) = solarxr {
-                        server.clear();
-                    }
                     eprintln!("TCP bridge connected; Wine named pipe not yet confirmed");
                 }
                 Err(e) if !connect_error_reported => {
@@ -345,7 +351,7 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
 
         if let Some((socket, rx)) = &mut connected {
             // A disconnected socket is detected by the read thread even if no writes are pending.
-            let (alive, received) = receive_trackers(rx, &mut trackers, solarxr);
+            let (alive, received) = receive_trackers(rx, &mut trackers);
             if received && !first_reply_seen {
                 eprintln!("Received a Rebocap protocol message via the Wine pipe");
                 first_reply_seen = true;
