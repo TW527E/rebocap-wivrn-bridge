@@ -1,3 +1,4 @@
+mod monado;
 mod protocol;
 mod solarxr;
 
@@ -237,6 +238,12 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
         session.create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)?;
     let view = session.create_reference_space(xr::ReferenceSpaceType::VIEW, xr::Posef::IDENTITY)?;
     let (actions, hands) = configure_hands(&instance, &session)?;
+    let stage_offset = monado::Stage::connect()
+        .inspect_err(|e| {
+            eprintln!("libmonado unavailable ({e}); a moved playspace (WayVR drag) will offset the trackers")
+        })
+        .ok();
+    let mut stage_offset_error_reported = false;
     let mut event_buffer = xr::EventDataBuffer::new();
     let mut started = false;
     let mut connected: Option<(TcpStream, Receiver<Option<Body>>)> = None;
@@ -309,6 +316,20 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
         // Monado's headless xrWaitFrame does not produce a frame or a display time.
         // Locate spaces at the runtime's monotonic time instead of using frame APIs.
         let time = instance.now()?;
+        // WiVRn treats SolarXR poses as tracking-origin poses and applies the STAGE
+        // offset to them itself. Rebocap must see the head in that same space, or a
+        // moved STAGE is applied twice to the trackers.
+        let offset = stage_offset.as_ref().and_then(|s| {
+            s.offset()
+                .inspect_err(|code| {
+                    if !stage_offset_error_reported {
+                        eprintln!("libmonado STAGE offset query failed ({code}); using raw STAGE poses");
+                        stage_offset_error_reported = true;
+                    }
+                })
+                .ok()
+        });
+        let to_origin = |p: xr::Posef| offset.map_or(p, |s| monado::compose(s, p));
         let head = view.locate(&stage, time)?;
         let valid = head
             .location_flags
@@ -320,7 +341,7 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
             eprintln!("WiVRn headset tracking valid: {valid}");
             last_head_valid = Some(valid);
         }
-        let pose = valid.then(|| Pose::from(head.pose));
+        let pose = valid.then(|| Pose::from(to_origin(head.pose)));
 
         if let Some((socket, rx)) = &mut connected {
             // A disconnected socket is detected by the read thread even if no writes are pending.
@@ -415,7 +436,7 @@ fn run(addr: SocketAddr, solarxr: Option<&solarxr::Server>) -> Result<()> {
                     && loc
                         .location_flags
                         .contains(xr::SpaceLocationFlags::ORIENTATION_VALID);
-                let hand_pose = tracked.then(|| Pose::from(loc.pose));
+                let hand_pose = tracked.then(|| Pose::from(to_origin(loc.pose)));
                 emit(&Output {
                     device: if i == 0 {
                         "left_controller"
