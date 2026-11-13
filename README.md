@@ -1,89 +1,131 @@
+**简体中文** · [繁體中文](README.zh-TW.md) · [English](README.en.md) · [日本語](README.ja.md)
+
 # monad2steamvr
 
-Linux の WiVRn + xrizer 環境で、Rebocap を VRChat のフルボディトラッキングに使うための CLI です。VRChat OSC は使わず、通常のトラッカーとして姿勢を渡します。
+在 Linux 的 WiVRn + xrizer 环境里，把 Rebocap 用作 VRChat 全身追踪的 CLI。不使用 VRChat OSC，而是以普通追踪器的形式传递姿态，**不需要 SteamVR**。
 
-[rebocap-linux](https://github.com/akazdayo/rebocap-linux) で Rebocap を動かす環境を前提に開発・動作確認しています。手順中の Wine prefix もその既定設定です。rebocap-linux 自体への直接の依存はなく、同等の Wine 環境でも利用できます。
+本仓库 fork 自 [akazdayo/rebocap-wivrn-bridge](https://github.com/akazdayo/rebocap-wivrn-bridge)，在原版基础上做了这些修改：
+
+- **支持官方 Linux 版 Rebocap**：官方 Linux 版自己在 `127.0.0.1:20480` 监听，用 `--bridge 127.0.0.1:20480` 直接连接即可，不需要 Wine 和 `bridge.exe`。
+- **更低的延迟**：原版里追踪器姿态要在两个 10 ms 的轮询循环里排队（平均多约 10 ms、最多约 20 ms），现在收到就立刻送给 WiVRn。
+- **游玩区移动修正**：通过 libmonado 读取 WiVRn 的 STAGE 偏移。用 WayVR 等工具拖动游玩区后，追踪器不会再偏离身体。
+
+> [!TIP]
+> 完整的安装教程和启动脚本 `rebocap-fbt`（自动检测官方版／Wine、部位检查、USB 连接）在
+> [TW527E/rebocap-linux-wivrn-fbt](https://github.com/TW527E/rebocap-linux-wivrn-fbt)。
 
 ```text
-WiVRn の頭部姿勢 → この CLI → Wine ブリッジ → Rebocap
-Rebocap のトラッカー姿勢 → この CLI → SolarXR → WiVRn → xrizer → VRChat
+官方 Linux 版：
+WiVRn 的头部姿态 → 本 CLI → Rebocap（:20480）
+Rebocap 的追踪器姿态 → 本 CLI → SolarXR → WiVRn → xrizer → VRChat
+
+Wine 版：
+WiVRn 的头部姿态 → 本 CLI → Wine 桥接 bridge.exe（:36850）→ Rebocap
+Rebocap 的追踪器姿态 → bridge.exe → 本 CLI → SolarXR → WiVRn → xrizer → VRChat
 ```
 
-## 必要なもの
+## 需求
 
-- x86_64 Linux、Wine
-- WiVRn + xrizer と接続できるヘッドセット
-- rebocap-linux でセットアップした Rebocap クライアントとセンサー
+- x86_64 Linux
+- WiVRn + xrizer，以及能连上它们的头显
+- Rebocap 接收器和追踪器，加上以下其中一种：
+  - **官方 Linux 版 Rebocap**（推荐）
+  - Wine 里的 Windows 版 Rebocap，加上 [rebocap-linux-compat](https://github.com/TW527E/rebocap-linux-compat) 的 `bridge.exe`
+    （原作者是用 [rebocap-linux](https://github.com/akazdayo/rebocap-linux) 搭建 Wine 环境；Bottles 也可以，参考 [rebocap-wine](https://github.com/TW527E/rebocap-wine)）
+- 构建需要 Rust 和 OpenXR loader 的开发库（Arch：`sudo pacman -S rust openxr pkgconf`）
 
-WiVRn 26.9 + xrizer 0.5 で動作確認済みです。WiVRn の SolarXR と xrizer の `monado` 機能を使用します（この組み合わせでは既定で有効）。
+已在 WiVRn 26.9 + xrizer 0.5／0.6 上验证。使用 WiVRn 的 SolarXR 和 xrizer 的 `monado` 功能（这个组合下默认启用）。
 
-## 使い方
-
-WiVRn サーバーと Rebocap を起動し、ヘッドセットはまだ接続せずに、次の順で進めます。
-
-### 1. Wine ブリッジを起動する
-
-[rebocap-linux-compat](https://github.com/dogesoulseller/rebocap-linux-compat) の `bridge.exe` を用意し、Rebocap と同じ Wine prefix で起動します。
+## 构建
 
 ```sh
-WINEPREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/rebocap/wineprefix" wine ./bridge.exe
+git clone https://github.com/TW527E/rebocap-wivrn-bridge
+cd rebocap-wivrn-bridge
+cargo build --release      # 产物：target/release/monad2steamvr
 ```
 
-この端末は起動したままにします。
+## 使用方法
 
-### 2. 別の端末で CLI を起動する
+先启动 WiVRn 服务器，**头显先不要连接**，然后按下面的顺序进行。
+
+### 1. 启动 Rebocap
+
+- **官方 Linux 版**：直接打开 Rebocap 即可。
+- **Wine 版**：启动 Rebocap 后，在**同一个 Wine prefix** 里启动 `bridge.exe`，并保持这个终端开着：
+
+  ```sh
+  WINEPREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/rebocap/wineprefix" wine ./bridge.exe
+  ```
+
+### 2. 在另一个终端启动 CLI
 
 ```sh
-cargo run --release -- --solarxr
+# 官方 Linux 版
+./target/release/monad2steamvr --solarxr --bridge 127.0.0.1:20480
+
+# Wine 版（--bridge 默认就是 127.0.0.1:36850）
+./target/release/monad2steamvr --solarxr
 ```
 
-`SolarXR ready` が表示されたら、ヘッドセットを接続・装着します。
+系统没有设置 OpenXR 默认 runtime（没有 `active_runtime.json`）时，前面加上
+`XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_wivrn.json`。
 
-### 3. キャリブレーションする
+看到 `SolarXR ready` 后，连接并戴上头显。
 
-Rebocap を VR モードにしてキャリブレーションし、xrizer 経由で VRChat を起動して FBT キャリブレーションを行います。既定では **腰・左右足の 3 点**を公開します。
+### 3. 校准
 
-**CLI を再起動したときや公開部位を変更したときは、ヘッドセットを再接続して VRChat も再起動してください。** WiVRn はヘッドセット接続時にトラッカー一覧を取得します。
+把 Rebocap 切到 VR 模式并校准，再通过 xrizer 启动 VRChat，进行 FBT 校准。默认只发布**腰和左右脚 3 个点**，用 `--tracker-roles` 修改。
 
-## オプション
+**重启 CLI 或修改发布的部位后，头显要重新连接，VRChat 也要重启。** WiVRn 只在头显连接时读取追踪器列表。
 
-| オプション | 用途 | 既定値 |
+## 选项
+
+| 选项 | 用途 | 默认值 |
 |---|---|---|
-| `--solarxr` | WiVRn にトラッカーを公開 | 無効 |
-| `--tracker-roles` | 公開する部位をカンマ区切りで指定 | `0,5,6` |
-| `--bridge` | Wine ブリッジの接続先 | `127.0.0.1:36850` |
-| `--solarxr-offset X,Y,Z` | 出力位置の補正（メートル、回転後に加算） | `0,0,0` |
-| `--solarxr-yaw DEGREES` | 出力方向の補正（+Y 軸回りの度数） | `0` |
+| `--solarxr` | 把追踪器发布给 WiVRn | 关闭 |
+| `--tracker-roles` | 要发布的部位，用逗号分隔 | `0,5,6` |
+| `--bridge` | Rebocap 的连接地址。官方 Linux 版用 `127.0.0.1:20480` | `127.0.0.1:36850`（`bridge.exe`） |
+| `--solarxr-offset X,Y,Z` | 输出位置修正（米，在旋转之后加上） | `0,0,0` |
+| `--solarxr-yaw DEGREES` | 输出方向修正（绕 +Y 轴的角度） | `0` |
 
-部位番号は `0`: 腰、`1/2`: 左右上腿、`3/4`: 左右下腿、`5/6`: 左右足、`7`: 胸、`9/10`: 左右上腕、`11/12`: 左右前腕です。
+部位编号：`0` 腰、`1/2` 左右大腿、`3/4` 左右小腿、`5/6` 左右脚、`7` 胸、`9/10` 左右上臂、`11/12` 左右前臂。
 
-全対応部位を公開する例:
+发布所有支持部位的例子：
 
 ```sh
-cargo run --release -- --solarxr --tracker-roles 0,1,2,3,4,5,6,7,9,10,11,12
+./target/release/monad2steamvr --solarxr --tracker-roles 0,1,2,3,4,5,6,7,9,10,11,12
 ```
 
-姿勢は JSON Lines として標準出力にも流れます。位置はメートル単位、+Y が上、-Z が前、回転は `[w,x,y,z]` です。接続ログは標準エラーに出ます。
+部位要和实际绑的追踪器一致。6 点套组没有脚的实体追踪器，`5/6` 只是 Rebocap 推算出的虚拟节点，数据断断续续，VRChat 会抓不到脚；这种情况下把小腿 `3/4` 发布出去，VRChat 会按位置把它当成脚。
 
-## うまく動かないとき
+姿态也会以 JSON Lines 输出到标准输出：位置单位是米，+Y 向上，-Z 向前，旋转是 `[w,x,y,z]`。连接日志输出到标准错误。
 
-| 症状 | 確認すること |
+## 排障
+
+| 症状 | 检查项目 |
 |---|---|
-| Rebocap が SteamVR を認識しない | ブリッジに `pipe open, relaying`、CLI に `WiVRn headset tracking valid: true` が出ているか。Wine prefix も確認 |
-| Rebocap の姿勢が届かない | VR モードでキャリブレーション済みか。CLI に `Received a Rebocap protocol message` が出ているか |
-| VRChat がトラッカーを認識しない | CLI に `SolarXR runtime connected` が出ているか。CLI を動かしたままヘッドセットを再接続し、VRChat を再起動 |
+| Rebocap 认不到 VR 头显 | Wine 版：bridge 是否显示 `pipe open, relaying`；CLI 是否显示 `WiVRn headset tracking valid: true`。另外确认 Wine prefix 是否相同 |
+| Rebocap 的姿态没有传过来 | 是否已切到 VR 模式并校准；CLI 是否显示 `Received a Rebocap protocol message`。官方 Linux 版在更新固件时也不会送数据 |
+| 官方 Linux 版连不上 | `20480` 同一时间只接受一个连接。确认没有开着官方 SteamVR 驱动或另一个 CLI |
+| VRChat 认不到追踪器 | CLI 是否显示 `SolarXR runtime connected`。保持 CLI 运行，重新连接头显，再重启 VRChat |
+| `Failed to connect to monado service process` | WiVRn 服务器没在运行（dashboard 开着不代表服务器开着） |
+| 拖动游玩区后追踪器偏离身体 | CLI 是否显示 `libmonado unavailable`。确认 WiVRn 的 runtime JSON 里有 `MND_libmonado_path` |
 
-## 開発
+日志里的 `Wine pipe`、`bridge.exe` 等字样沿用自原版，连接官方 Linux 版时也会出现，可以忽略。
 
-ビルドには Rust と OpenXR loader の開発用ライブラリが必要です。
+## 开发
 
 ```sh
 cargo build --release
 cargo test
 ```
 
-参考: [WiVRn と OpenVR](https://github.com/WiVRn/WiVRn/blob/master/docs/steamvr.md) · [Rebocap 通信仕様](https://github.com/dogesoulseller/rebocap-linux-compat/blob/main/docs/protocol.md)
+`monado_wire_compatibility` 测试需要 WiVRn 的 Monado 源代码，默认跳过：`MONADO_SOURCE=<路径> cargo test -- --ignored`。
 
-## 外部コンポーネントのライセンス
+参考：[WiVRn 与 OpenVR](https://github.com/WiVRn/WiVRn/blob/master/docs/steamvr.md) · [Rebocap 通信协议](https://github.com/dogesoulseller/rebocap-linux-compat/blob/main/docs/protocol.md)
 
-Wine ブリッジ `bridge.exe` は [rebocap-linux-compat](https://github.com/dogesoulseller/rebocap-linux-compat) のコードを使用しています。Copyright (c) 2026 Marcin Czerwonka、MIT License。全文は [LICENSES/rebocap-linux-compat.txt](LICENSES/rebocap-linux-compat.txt) を参照してください。
+## 外部组件的许可
+
+Wine 桥接 `bridge.exe` 使用了 [rebocap-linux-compat](https://github.com/dogesoulseller/rebocap-linux-compat) 的代码。Copyright (c) 2026 Marcin Czerwonka，MIT License。全文见 [LICENSES/rebocap-linux-compat.txt](LICENSES/rebocap-linux-compat.txt)。
+
+本 CLI 的原作者是 [akazdayo](https://github.com/akazdayo)。原仓库目前没有为自己的代码附上许可条款。
