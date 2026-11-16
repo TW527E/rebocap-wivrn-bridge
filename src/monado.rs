@@ -33,8 +33,47 @@ pub struct Stage {
     get_offset: GetOffset,
 }
 
+/// The runtime manifest the OpenXR loader would use: XR_RUNTIME_JSON, else the first
+/// active_runtime[.<arch>].json in $XDG_CONFIG_HOME, $XDG_CONFIG_DIRS and /etc.
+fn runtime_manifest() -> Result<PathBuf, String> {
+    if let Some(json) = env::var_os("XR_RUNTIME_JSON") {
+        return Ok(PathBuf::from(json));
+    }
+    let mut dirs = Vec::new();
+    match env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(home) => dirs.push(PathBuf::from(home)),
+        None => {
+            if let Some(home) = env::var_os("HOME") {
+                dirs.push(PathBuf::from(home).join(".config"));
+            }
+        }
+    }
+    let config_dirs = env::var("XDG_CONFIG_DIRS").ok().filter(|v| !v.is_empty());
+    dirs.extend(
+        config_dirs
+            .as_deref()
+            .unwrap_or("/etc/xdg")
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from),
+    );
+    dirs.push(PathBuf::from("/etc"));
+    let names = [format!("active_runtime.{}.json", env::consts::ARCH), "active_runtime.json".into()];
+    for dir in dirs {
+        for name in &names {
+            let candidate = dir.join("openxr/1").join(name);
+            if candidate.is_file() {
+                // active_runtime.json is usually a symlink; relative library paths are
+                // relative to the runtime's own manifest.
+                return fs::canonicalize(&candidate).map_err(|e| format!("{}: {e}", candidate.display()));
+            }
+        }
+    }
+    Err("XR_RUNTIME_JSON is not set and no active_runtime.json was found".into())
+}
+
 fn libmonado_path() -> Result<PathBuf, String> {
-    let json = PathBuf::from(env::var_os("XR_RUNTIME_JSON").ok_or("XR_RUNTIME_JSON is not set")?);
+    let json = runtime_manifest()?;
     let manifest: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(&json).map_err(|e| format!("{}: {e}", json.display()))?,
     )
